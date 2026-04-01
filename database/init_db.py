@@ -1,132 +1,213 @@
 #!/usr/bin/env python3
-"""Initialize SQLite database for database"""
+"""Initialize the SQLite database schema for the Notemaster notes app.
 
-import sqlite3
+This script is intended to run in the dedicated `database` container.
+It creates:
+- notes: core note records
+- tags: unique tag names
+- note_tags: many-to-many between notes and tags
+- notes_fts: FTS5 virtual table for full-text search over note title+content
+- triggers to keep the FTS index in sync
+
+Environment:
+- SQLITE_DB: optional; absolute/relative path to the SQLite database file.
+  If not provided, defaults to ./myapp.db
+
+Notes:
+- FTS5 is available in most modern SQLite builds. If unavailable, the script will
+  fall back to basic schema creation without FTS (search will still work using
+  LIKE in the backend).
+"""
+
+from __future__ import annotations
+
 import os
+import sqlite3
+from pathlib import Path
+from typing import Optional
 
-DB_NAME = "myapp.db"
-DB_USER = "kaviasqlite"  # Not used for SQLite, but kept for consistency
-DB_PASSWORD = "kaviadefaultpassword"  # Not used for SQLite, but kept for consistency
-DB_PORT = "5000"  # Not used for SQLite, but kept for consistency
+DEFAULT_DB_NAME = "myapp.db"
 
-print("Starting SQLite setup...")
 
-# Check if database already exists
-db_exists = os.path.exists(DB_NAME)
-if db_exists:
-    print(f"SQLite database already exists at {DB_NAME}")
-    # Verify it's accessible
+def _get_db_path() -> Path:
+    """Resolve the SQLite database file path from env or default."""
+    env_path = os.getenv("SQLITE_DB")
+    if env_path:
+        return Path(env_path).expanduser().resolve()
+    return Path.cwd() / DEFAULT_DB_NAME
+
+
+def _connect(db_path: Path) -> sqlite3.Connection:
+    """Create a SQLite connection with pragmas suitable for this app."""
+    conn = sqlite3.connect(str(db_path))
+    conn.row_factory = sqlite3.Row
+    # Reasonable defaults for a single-file app.
+    conn.execute("PRAGMA foreign_keys = ON;")
+    conn.execute("PRAGMA journal_mode = WAL;")
+    conn.execute("PRAGMA synchronous = NORMAL;")
+    return conn
+
+
+def _fts5_available(conn: sqlite3.Connection) -> bool:
+    """Return True if SQLite FTS5 appears to be available."""
     try:
-        conn = sqlite3.connect(DB_NAME)
-        conn.execute("SELECT 1")
+        conn.execute("CREATE VIRTUAL TABLE IF NOT EXISTS __fts5_test USING fts5(content);")
+        conn.execute("DROP TABLE IF EXISTS __fts5_test;")
+        return True
+    except sqlite3.Error:
+        return False
+
+
+def _create_schema(conn: sqlite3.Connection, *, enable_fts: bool) -> None:
+    """Create app schema and optionally FTS support."""
+    # Core tables.
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS notes (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            title TEXT NOT NULL,
+            content TEXT NOT NULL DEFAULT '',
+            is_archived INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+            updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_notes_updated_at ON notes(updated_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_notes_archived ON notes(is_archived);
+
+        CREATE TABLE IF NOT EXISTS tags (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL UNIQUE,
+            created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+        );
+
+        CREATE TABLE IF NOT EXISTS note_tags (
+            note_id INTEGER NOT NULL,
+            tag_id INTEGER NOT NULL,
+            created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+            PRIMARY KEY (note_id, tag_id),
+            FOREIGN KEY (note_id) REFERENCES notes(id) ON DELETE CASCADE,
+            FOREIGN KEY (tag_id) REFERENCES tags(id) ON DELETE CASCADE
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_note_tags_note_id ON note_tags(note_id);
+        CREATE INDEX IF NOT EXISTS idx_note_tags_tag_id ON note_tags(tag_id);
+        """
+    )
+
+    if not enable_fts:
+        return
+
+    # FTS table: keep an external-content-like pattern by syncing via triggers.
+    conn.executescript(
+        """
+        CREATE VIRTUAL TABLE IF NOT EXISTS notes_fts
+        USING fts5(
+            title,
+            content,
+            note_id UNINDEXED,
+            tokenize = 'unicode61'
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_notes_fts_note_id ON notes_fts(note_id);
+
+        CREATE TRIGGER IF NOT EXISTS notes_ai AFTER INSERT ON notes BEGIN
+            INSERT INTO notes_fts(rowid, title, content, note_id)
+            VALUES (new.id, new.title, new.content, new.id);
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS notes_ad AFTER DELETE ON notes BEGIN
+            DELETE FROM notes_fts WHERE rowid = old.id;
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS notes_au AFTER UPDATE ON notes BEGIN
+            UPDATE notes_fts
+            SET title = new.title,
+                content = new.content,
+                note_id = new.id
+            WHERE rowid = old.id;
+        END;
+        """
+    )
+
+    # Backfill FTS for existing notes (idempotent).
+    conn.execute("DELETE FROM notes_fts;")
+    conn.execute(
+        """
+        INSERT INTO notes_fts(rowid, title, content, note_id)
+        SELECT id, title, content, id FROM notes;
+        """
+    )
+
+
+def _seed_example_data(conn: sqlite3.Connection) -> None:
+    """Insert a small amount of example data (idempotent-ish)."""
+    # If already has notes, don't re-seed.
+    existing = conn.execute("SELECT COUNT(1) AS c FROM notes;").fetchone()["c"]
+    if existing and int(existing) > 0:
+        return
+
+    notes = [
+        ("Welcome to Notemaster", "Create notes, tag them, and search instantly."),
+        ("Shopping list", "- Coffee\n- Eggs\n- Bread\n- Olive oil"),
+        ("Project ideas", "1) Personal knowledge base\n2) Habit tracker\n3) CLI journal"),
+    ]
+    for title, content in notes:
+        conn.execute("INSERT INTO notes(title, content) VALUES(?, ?);", (title, content))
+
+    # Tags
+    for t in ["welcome", "personal", "todo", "ideas"]:
+        conn.execute("INSERT OR IGNORE INTO tags(name) VALUES(?);", (t,))
+
+    # Attach some tags
+    note_ids = [r["id"] for r in conn.execute("SELECT id FROM notes ORDER BY id;").fetchall()]
+    tag_map = {r["name"]: r["id"] for r in conn.execute("SELECT id, name FROM tags;").fetchall()}
+
+    def attach(note_id: int, tag_name: str) -> None:
+        conn.execute(
+            "INSERT OR IGNORE INTO note_tags(note_id, tag_id) VALUES(?, ?);",
+            (note_id, tag_map[tag_name]),
+        )
+
+    if len(note_ids) >= 3:
+        attach(note_ids[0], "welcome")
+        attach(note_ids[0], "personal")
+        attach(note_ids[1], "todo")
+        attach(note_ids[2], "ideas")
+        attach(note_ids[2], "personal")
+
+
+def main() -> None:
+    """Entrypoint for initializing database."""
+    db_path = _get_db_path()
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+
+    print("Starting SQLite setup for Notemaster...")
+    print(f"Database path: {db_path}")
+
+    conn = _connect(db_path)
+    try:
+        enable_fts = _fts5_available(conn)
+        if enable_fts:
+            print("FTS5: available; enabling full-text search index.")
+        else:
+            print("FTS5: NOT available; search will fall back to LIKE queries.")
+
+        _create_schema(conn, enable_fts=enable_fts)
+        _seed_example_data(conn)
+        conn.commit()
+
+        # Write a helper env file for the bundled db_visualizer.
+        visualizer_dir = Path.cwd() / "db_visualizer"
+        visualizer_dir.mkdir(parents=True, exist_ok=True)
+        sqlite_env_path = visualizer_dir / "sqlite.env"
+        sqlite_env_path.write_text(f'export SQLITE_DB="{db_path}"\n', encoding="utf-8")
+
+        print("SQLite setup complete.")
+        print("Wrote db_visualizer/sqlite.env (source it to point the viewer at this DB).")
+    finally:
         conn.close()
-        print("Database is accessible and working.")
-    except Exception as e:
-        print(f"Warning: Database exists but may be corrupted: {e}")
-else:
-    print("Creating new SQLite database...")
 
-# Create database with sample tables
-conn = sqlite3.connect(DB_NAME)
-cursor = conn.cursor()
 
-# Create initial schema
-cursor.execute("""
-    CREATE TABLE IF NOT EXISTS app_info (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        key TEXT UNIQUE NOT NULL,
-        value TEXT,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-    )
-""")
-
-# Create a sample users table as an example
-cursor.execute("""
-    CREATE TABLE IF NOT EXISTS users (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        username TEXT UNIQUE NOT NULL,
-        email TEXT UNIQUE NOT NULL,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-    )
-""")
-
-# Insert initial data
-cursor.execute("INSERT OR REPLACE INTO app_info (key, value) VALUES (?, ?)", 
-               ("project_name", "database"))
-cursor.execute("INSERT OR REPLACE INTO app_info (key, value) VALUES (?, ?)", 
-               ("version", "0.1.0"))
-cursor.execute("INSERT OR REPLACE INTO app_info (key, value) VALUES (?, ?)", 
-               ("author", "John Doe"))
-cursor.execute("INSERT OR REPLACE INTO app_info (key, value) VALUES (?, ?)", 
-               ("description", ""))
-
-conn.commit()
-
-# Get database statistics
-cursor.execute("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")
-table_count = cursor.fetchone()[0]
-
-cursor.execute("SELECT COUNT(*) FROM app_info")
-record_count = cursor.fetchone()[0]
-
-conn.close()
-
-# Save connection information to a file
-current_dir = os.getcwd()
-connection_string = f"sqlite:///{current_dir}/{DB_NAME}"
-
-try:
-    with open("db_connection.txt", "w") as f:
-        f.write(f"# SQLite connection methods:\n")
-        f.write(f"# Python: sqlite3.connect('{DB_NAME}')\n")
-        f.write(f"# Connection string: {connection_string}\n")
-        f.write(f"# File path: {current_dir}/{DB_NAME}\n")
-    print("Connection information saved to db_connection.txt")
-except Exception as e:
-    print(f"Warning: Could not save connection info: {e}")
-
-# Create environment variables file for Node.js viewer
-db_path = os.path.abspath(DB_NAME)
-
-# Ensure db_visualizer directory exists
-if not os.path.exists("db_visualizer"):
-    os.makedirs("db_visualizer", exist_ok=True)
-    print("Created db_visualizer directory")
-
-try:
-    with open("db_visualizer/sqlite.env", "w") as f:
-        f.write(f"export SQLITE_DB=\"{db_path}\"\n")
-    print(f"Environment variables saved to db_visualizer/sqlite.env")
-except Exception as e:
-    print(f"Warning: Could not save environment variables: {e}")
-
-print("\nSQLite setup complete!")
-print(f"Database: {DB_NAME}")
-print(f"Location: {current_dir}/{DB_NAME}")
-print("")
-
-print("To use with Node.js viewer, run: source db_visualizer/sqlite.env")
-
-print("\nTo connect to the database, use one of the following methods:")
-print(f"1. Python: sqlite3.connect('{DB_NAME}')")
-print(f"2. Connection string: {connection_string}")
-print(f"3. Direct file access: {current_dir}/{DB_NAME}")
-print("")
-
-print("Database statistics:")
-print(f"  Tables: {table_count}")
-print(f"  App info records: {record_count}")
-
-# If sqlite3 CLI is available, show how to use it
-try:
-    import subprocess
-    result = subprocess.run(['which', 'sqlite3'], capture_output=True, text=True)
-    if result.returncode == 0:
-        print("")
-        print("SQLite CLI is available. You can also use:")
-        print(f"  sqlite3 {DB_NAME}")
-except:
-    pass
-
-# Exit successfully
-print("\nScript completed successfully.")
+if __name__ == "__main__":
+    main()
